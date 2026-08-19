@@ -9,7 +9,8 @@ expects 'mu' folder in /mnt/vmshared/ -- will be altered later, but this is kept
 
 good to remember when setting up alpine for pager:
 
-make shared folder (auto mount), will be at /mnt/(folder)
+```
+make shared folder (auto mount) at /mnt/(folder)
 
 (install alpine)
 
@@ -26,3 +27,4 @@ apk add xinit
 apk add xorg-server
 
 setup-xorg-base
+```
