@@ -14,6 +14,8 @@ make shared folder (auto mount) at /mnt/vmshared/
 mkdir -p /mnt/vmshared/
 mount -t vboxsf vmshared /mnt/vmshared/
 
+setup-alpine
+
 setup-apkrepos -c
 apk add py3-pygame
 
