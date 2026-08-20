@@ -3,7 +3,7 @@ pygame pseudo-OS for a minimal DAP. for linux.
 
 ---
 
-expects 'mu' folder in /mnt/vmshared/ -- will be altered later, but this is kept for debugging.
+point to music folder in loc.txt
 
 ---
 ## Setup
@@ -11,6 +11,7 @@ expects 'mu' folder in /mnt/vmshared/ -- will be altered later, but this is kept
 setup-alpine
 ping -c 3 google.com
 ```
+important, make user named `p`
 if that doesn't work, do  the following
 ```
 ip link set eth0 up
@@ -30,7 +31,7 @@ ping -c 3 google.com
 
 apk update
 apk upgrade
-apk add python3 py3-pip py3-virtualenv python3-dev build-base pkgconf git
+apk add python3 py3-pip py3-virtualenv python3-dev build-base pkgconf git nano
 apk add --update --no-cache --repository http://dl-cdn.alpinelinux.org/alpine/edge/community/ mpv mpv-dev sdl2 sdl2-dev sdl2_image sdl2_image-dev sdl2_mixer sdl2_mixer-dev sdl2_ttf sdl2_ttf-dev freetype freetype-dev xorg-server xinit xf86-video-fbdev xf86-input-libinput mesa mesa-dri-gallium mesa-gl
 
 mkdir -p ~/pager
@@ -46,32 +47,23 @@ python -c "import numpy, tinytag, pygame, mpv; print('OK')"
 find /usr/lib /lib -iname '*mpv*' 2>/dev/null
 
 ls -lah ~/pager/mu
+
+cp lpr.otf /usr/share/fonts
+fc-list
+
+nano /sbin/myinit
+
+  #!/bin/sh
+
+  source /root/p/.venv/bin/activate
+  cd /root/pager/
+  exec python /root/pager/2144_optimized.py
+
+nano /boot/extlinux.conf
+
+  ...
+  APPEND ... init=/sbin/myinit
 ```
 ---
 
 good to remember when setting up alpine for pager:
-
-```
-make shared folder (auto mount) at /mnt/vmshared/
-mkdir -p /mnt/vmshared/
-mount -t vboxsf vmshared /mnt/vmshared/
-
-setup-alpine
-
-setup-apkrepos -c
-apk add py3-pygame
-
-python3 -m venv --system-site-packages
-source .venv/bin/activate
-pip install tinytag
-pip install mpv
-pip install numpy
-
-move Lower Pixel font from shared folder to ~/.fonts
-
-apk add mpv mpv-libs xinit xorg-server
-apk add 
-apk add 
-
-setup-xorg-base
-```
