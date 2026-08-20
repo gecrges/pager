@@ -23,6 +23,9 @@ python3 -m venv --system-site-packages
 source .venv/bin/activate
 pip install tinytag
 pip install mpv
+pip install numpy
+
+move Lower Pixel font from shared folder to ~/.fonts
 
 apk add mpv mpv-libs
 apk add xinit
