@@ -17,6 +17,9 @@ import mpv
 # SETUP
 # ===========================================================================
 
+MU_LOC = open("/root/pager/loc.txt").read()
+print(os.getcwd())
+
 pygame.init()
 
 player = mpv.MPV(
@@ -286,9 +289,9 @@ def scan_library():
 
     scanned_files = [
         f
-        for f in listdir("/mnt/vmshared/mu")
+        for f in listdir(MU_LOC[:-1])
         if isfile(
-            join("/mnt/vmshared/mu", f)
+            join(MU_LOC[:-1], f)
         )
     ]
 
@@ -300,7 +303,7 @@ def scan_library():
     for filename in scanned_files:
 
         tag: TinyTag = TinyTag.get(
-            "/mnt/vmshared/mu/" + filename
+            MU_LOC + filename
         )
 
         if tag.album not in scanned_albums:
@@ -1278,7 +1281,7 @@ def load_current_tag():
     ):
 
         current_tag = TinyTag.get(
-            "/mnt/vmshared/mu/"
+            MU_LOC
             + queue[queue_index],
             image=True
         )
@@ -1455,7 +1458,7 @@ def start_playing(
     # -----------------------------------------------------------------------
 
     first_file = join(
-        "/mnt/vmshared/mu",
+        MU_LOC[:-1],
         queue[start_index]
     )
 
@@ -1479,7 +1482,7 @@ def start_playing(
         player.command(
             "loadfile",
             join(
-                "/mnt/vmshared/mu",
+                MU_LOC[:-1],
                 filename
             ),
             "append"
