@@ -64,6 +64,5 @@ nano /boot/extlinux.conf
   ...
   APPEND ... init=/sbin/myinit
 ```
+important for vm: turn audio on... as stupid as that sounds
 ---
-
-good to remember when setting up alpine for pager:
