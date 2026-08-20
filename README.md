@@ -37,8 +37,6 @@ apk add --update --no-cache --repository http://dl-cdn.alpinelinux.org/alpine/ed
 mkdir -p ~/pager
 mount -t vboxsf vmshared ~/pager
 
-mkdir -p ~/p
-cd ~/p
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip setuptools wheel
@@ -50,19 +48,8 @@ ls -lah ~/pager/mu
 
 cp lpr.otf /usr/share/fonts
 fc-list
-
-nano /sbin/myinit
-
-  #!/bin/sh
-
-  source /root/p/.venv/bin/activate
-  cd /root/pager/
-  exec python /root/pager/2144_optimized.py
-
-nano /boot/extlinux.conf
-
-  ...
-  APPEND ... init=/sbin/myinit
 ```
 important for vm: turn audio on... as stupid as that sounds
+
+TODO: pygame starts at boot, exiting shuts off machine
 ---
