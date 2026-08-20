@@ -10,9 +10,9 @@ expects 'mu' folder in /mnt/vmshared/ -- will be altered later, but this is kept
 good to remember when setting up alpine for pager:
 
 ```
-make shared folder (auto mount) at /mnt/(folder)
-
-(install alpine)
+make shared folder (auto mount) at /mnt/vmshared/
+mkdir -p /mnt/vmshared/
+mount -t vboxsf vmshared /mnt/vmshared/
 
 setup-apkrepos -c
 apk add py3-pygame
