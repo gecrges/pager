@@ -7,6 +7,7 @@ point to music folder in loc.txt
 
 ---
 ## Setup
+### Important: if you are installing Alpine on a virtual machine, DO NOT reboot after installing. Close the VM, remove iso attachment, and restart.
 ```
 setup-alpine
 ping -c 3 google.com
