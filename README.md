@@ -41,7 +41,7 @@ ls -lah ~/pager/mu
 ```
 install Lower Pixel font:
 ```
-cp lpr.otf /usr/share/fonts
+cp ~/pager/lpr.otf /usr/share/fonts
 fc-list
 ```
 important for vm: turn audio on... as stupid as that sounds
