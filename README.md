@@ -46,6 +46,18 @@ fc-list
 ```
 important for vm: turn audio on... as stupid as that sounds
 
+## Compile Python for machine
+```
+python
+import py_compile
+py_compile.compile('/root/pager/pager.py')
+```
+`ctrl z` to exit out of py console
+compiling will print the new compiled file path, probably something like `/root/pager/__pycache__/pager.cpython-314.pyc`. for the next step, it will be referred to as [x].
+```
+mv [x] /root/pager/pager.pyc
+```
+
 ### Make pyscript run on boot
 ```
 rc-update add local default
