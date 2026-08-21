@@ -12,20 +12,6 @@ point to music folder in loc.txt
 setup-alpine
 ping -c 3 google.com
 ```
-important, make user named `p`
-if that doesn't work, do  the following
-```
-ip link set eth0 up
-udhcpc -i eth0
-ip route                  (optional)
-ping -c 3 google.com
-```
-close, save state of drive
-remove attachment (optical drive)
-close fully
-restart
-
-
 ## After reboot: APK packages
 ```
 ping -c 3 google.com
