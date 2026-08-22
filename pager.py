@@ -319,10 +319,25 @@ def _on_playlist_pos_change(name, value):
     )
 
 
-player.observe_property(
-    'playlist-pos',
-    _on_playlist_pos_change
-)
+# NOTE: player.observe_property('playlist-pos', _on_playlist_pos_change)
+# is intentionally NOT called here.
+#
+# mpv fires an observer's first notification as soon as it's registered -
+# and by this point in the file, the silence primer has already been
+# loaded ("replace", back near the MPV() setup), so playlist-pos already
+# has a real value (0) for that first notification to report. That
+# notification runs on mpv's own event thread, immediately, racing the
+# main thread here - which still has a long way to go (fonts, the CD
+# rotation cache, EQ setup, ...) before it reaches the scroll_states and
+# cd_angle_reset() this callback depends on. Most of the time the main
+# thread wins that race by a wide margin, which is exactly what made
+# this intermittent rather than a guaranteed crash - right up until
+# something as unrelated as a changed library path shifted the timing.
+#
+# The actual player.observe_property(...) call for this callback is
+# below, right after cd_angle_reset() is defined - see that section -
+# so the registration itself can no longer land before its dependencies
+# exist, regardless of how mpv's event thread happens to schedule it.
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +363,10 @@ def _on_time_pos_change(name, value):
         _time_pos_cache = value
 
 
+# _on_time_pos_change only ever touches _time_pos_cache, which is already
+# defined right above by the time this runs, so this one observer is safe
+# to register immediately - unlike playlist-pos, there's no forward
+# dependency here to race against.
 player.observe_property(
     'time-pos',
     _on_time_pos_change
@@ -1265,30 +1284,46 @@ def draw_list(
     display_func=str
 ):
 
+    surface_height = surface.get_height()
+
     clip_rect = pygame.Rect(
         0,
         y,
         surface.get_width() - x,
-        surface.get_height() - y
+        surface_height - y
     )
 
     surface.set_clip(
         clip_rect
     )
 
-    for i, item in enumerate(items):
+    # draw_list() runs every frame on whichever browser screen is active,
+    # but only a handful of rows ever fit on a 32px-tall display. Looping
+    # over the full item list here (all albums, all songs, ...) and
+    # skipping the off-screen ones after computing each row's position
+    # is O(item count) per frame regardless of library size. Since rows
+    # are fixed-height and in a fixed order, the visible range can be
+    # computed directly from scroll_offset instead - only those items
+    # get iterated, drawn, or have display_func() called on them at all.
+    first_visible = max(
+        0,
+        scroll_offset // row_height
+    )
+
+    last_visible = min(
+        len(items),
+        (scroll_offset + surface_height - y) // row_height + 1
+    )
+
+    for i in range(first_visible, last_visible):
+
+        item = items[i]
 
         row_y = (
             y
             + i * row_height
             - scroll_offset
         )
-
-        if (
-            row_y + row_height < 0
-            or row_y > surface.get_height()
-        ):
-            continue
 
         if i == selected_index:
 
@@ -1773,6 +1808,18 @@ def cd_angle_reset():
     cd_angle = 0
 
 
+# Deferred from up near the MPV() setup - see the NOTE by
+# _on_playlist_pos_change's definition for why. scroll_states and
+# cd_angle_reset (this callback's two dependencies) both exist by this
+# point, so registering the observer here means its first, immediate
+# notification - fired on mpv's own event thread - can no longer land
+# before what it needs is ready.
+player.observe_property(
+    'playlist-pos',
+    _on_playlist_pos_change
+)
+
+
 # ===========================================================================
 # SCROLLING TEXT
 # ===========================================================================
@@ -2216,6 +2263,15 @@ def jump_to_track(
 
     is_paused = False
 
+    # jump_to_track always lands on a playing track, so mpv itself needs
+    # to actually be unpaused here too - not just the app's is_paused
+    # flag. If the track being left was paused, mpv is still sitting
+    # with pause=True and volume faded down to 0 (see toggle_pause());
+    # resetting is_paused above without this just desyncs the app's
+    # idea of "playing" from mpv's actual state, which is what made
+    # spacebar do nothing on the first press after a skip-while-paused.
+    player.pause = False
+    player.volume = current_volume
 
     # IMPORTANT:
     # Do not manually update queue_index here.
