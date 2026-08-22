@@ -1,6 +1,7 @@
 # pager
 pygame pseudo-OS for a minimal DAP. for linux.
 
+## TODO: user-customized MAX_OUTPUT_VRMS -> V = SQRT(PR)
 ---
 
 point to music folder in loc.txt
