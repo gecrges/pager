@@ -10,7 +10,6 @@ from os.path import isfile, join
 import numpy as np # type: ignore
 from tinytag import TinyTag # type: ignore
 import pygame # type: ignore
-import os
 import mpv # type: ignore
 
 
