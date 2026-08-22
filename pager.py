@@ -1,7 +1,9 @@
 import io
+import json
 import math
 import random
 import threading
+import time
 from os import listdir
 from os.path import isfile, join
 
@@ -18,6 +20,12 @@ import mpv # type: ignore
 
 MU_LOC = open("/root/pager/loc.txt").read()
 print(os.getcwd())
+
+# Volume and EQ get persisted here so the next boot picks up right where
+# the last session left off, instead of coming back up at the defaults
+# every time. Lives next to loc.txt for the same reason loc.txt lives
+# where it does - one fixed, known location regardless of cwd.
+SETTINGS_PATH = "/root/pager/settings.json"
 
 pygame.init()
 
@@ -48,8 +56,6 @@ clock = pygame.time.Clock()
 
 WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
-YELLOW = (255, 200, 0)
-RED = (255, 60, 60)
 
 TRACK_CHANGED = pygame.USEREVENT + 1
 
@@ -300,23 +306,178 @@ eq_backend = EQBackend(
 
 
 # ===========================================================================
+# SETTINGS PERSISTENCE (volume + EQ)
+# ===========================================================================
+#
+# Volume and EQ are the two things someone tunes once for their own ears
+# and gear, then expects to just stay put - having to redo them after
+# every reboot would be a real annoyance. Both get read from
+# SETTINGS_PATH at startup (falling back to sane defaults if the file is
+# missing or unreadable) and written back out any time either changes.
+
+DEFAULT_VOLUME = 100
+
+
+def load_settings():
+    """
+    Returns (volume, eq_values) - eq_values is a dict of {freq: 0-100},
+    one entry per FREQUENCIES band. Missing file, corrupt JSON, or a
+    partial/old settings file all just fall back to defaults rather than
+    blowing up startup over a settings file.
+    """
+
+    try:
+        with open(SETTINGS_PATH, "r") as f:
+            data = json.load(f)
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        print(f"[settings] no usable settings file ({exc!r}), using defaults")
+        data = {}
+
+    volume = max(
+        0,
+        min(
+            100,
+            int(data.get("volume", DEFAULT_VOLUME))
+        )
+    )
+
+    # JSON object keys are always strings, so they need converting back
+    # to int to line up with FREQUENCIES / EQBackend's int keys. Any
+    # band missing from the file (new band added later, older/partial
+    # file, etc.) just falls back to EQBackend's own flat-50 default.
+    raw_eq = data.get("eq", {})
+
+    eq_values = {
+        freq: int(raw_eq[str(freq)])
+        if str(freq) in raw_eq
+        else 50
+        for freq in FREQUENCIES
+    }
+
+    return volume, eq_values
+
+
+def _write_settings_now():
+    """
+    Does the actual disk write - snapshots current_volume/eq_backend and
+    writes them out. Runs on a background thread (see
+    schedule_settings_save below), so a slow disk write never stalls the
+    main loop that's also driving drawing and audio-adjacent calls.
+    """
+
+    data = {
+        "volume": current_volume,
+        "eq": {
+            str(freq): eq_backend.get(freq)
+            for freq in FREQUENCIES
+        }
+    }
+
+    try:
+        with open(SETTINGS_PATH, "w") as f:
+            json.dump(data, f)
+    except OSError as exc:
+        print(f"[settings] failed to save: {exc!r}")
+
+
+# Debounced, background settings save.
+#
+# adjust_volume()/eq_adjust() fire once per keypress (this display's
+# controls don't use pygame's key-repeat), so this is nowhere near a
+# per-frame write - but someone quickly stepping through several EQ
+# bands, or tapping volume up several times in a row, would otherwise
+# still mean one blocking disk write per tap. Debouncing collapses a
+# burst of changes into a single write shortly after they stop, and
+# doing that write on its own thread means even a slow write (a tired
+# SD card, a busy filesystem) can never stutter the UI or the pause
+# fade, both of which live on the main thread.
+SETTINGS_SAVE_DEBOUNCE = 0.5  # seconds of quiet before actually writing
+
+_settings_save_timer = None
+_settings_save_lock = threading.Lock()
+
+
+def schedule_settings_save():
+
+    global _settings_save_timer
+
+    with _settings_save_lock:
+
+        if _settings_save_timer is not None:
+            _settings_save_timer.cancel()
+
+        _settings_save_timer = threading.Timer(
+            SETTINGS_SAVE_DEBOUNCE,
+            _write_settings_now
+        )
+
+        # Daemon so a pending save never blocks the process from exiting -
+        # flush_settings_save() below handles making sure it still
+        # actually gets written before a clean shutdown.
+        _settings_save_timer.daemon = True
+        _settings_save_timer.start()
+
+
+def flush_settings_save():
+    """
+    Cancels any pending debounced save and writes immediately instead -
+    call this on the way out (see the bottom of the file) so quitting
+    within the debounce window can't silently drop the last change.
+    """
+
+    global _settings_save_timer
+
+    with _settings_save_lock:
+
+        if _settings_save_timer is not None:
+            _settings_save_timer.cancel()
+            _settings_save_timer = None
+
+    _write_settings_now()
+
+
+_saved_volume, _saved_eq = load_settings()
+
+for _freq, _value in _saved_eq.items():
+    eq_backend.set(_freq, _value)
+
+
+# ===========================================================================
 # VOLUME
 # ===========================================================================
 
 VOLUME_STEP = 5
 
+# The "real"/target volume the user has dialed in - kept separate from
+# player.volume because player.volume gets driven down to 0 and back
+# during the pause/unpause fade (see PAUSE_FADE below) without that
+# ever being something the user actually asked for or that should get
+# saved to disk.
+current_volume = _saved_volume
+
+player.volume = current_volume
+
 
 def adjust_volume(delta):
 
-    current = player.volume or 0
+    global current_volume
 
-    player.volume = max(
+    current_volume = max(
         0,
         min(
             100,
-            current + delta
+            current_volume + delta
         )
     )
+
+    # While paused, player.volume is deliberately sitting at 0 (see
+    # PAUSE_FADE) - don't stomp that with the new target, or the pause
+    # silence breaks and unpausing loses its fade-in. The new value
+    # still gets used the moment unpausing fades back up.
+    if not is_paused:
+        player.volume = current_volume
+
+    schedule_settings_save()
 
 
 # ===========================================================================
@@ -342,6 +503,25 @@ METER_FLOOR_DBFS = -90.0
 
 OK_LVL = 70.0        # and under, of course
 DANGER_LVL = 80.0
+
+# ---------------------------------------------------------------------------
+# VU METER (visual, right side of the dbmeter screen)
+# ---------------------------------------------------------------------------
+# Needle sweeps across this SPL range - below VU_METER_MIN_DB it pins at
+# the left stop, above VU_METER_MAX_DB it pins at the right stop.
+VU_METER_MIN_DB = 40.0
+VU_METER_MAX_DB = 100.0
+
+# How fast the needle chases the live reading, in "fraction of the way
+# there per second". Real VU meters have mechanical inertia - the needle
+# doesn't jump, it swings and settles - so we damp toward the target
+# instead of snapping to it every frame.
+VU_NEEDLE_SPEED = 10.0
+
+# Needle sweep, in degrees, standard math convention (0=right, 90=up).
+# 150 -> 30 gives a classic ~120 degree gauge arc across the top.
+VU_ANGLE_MIN_DEG = 150.0  # quietest reading
+VU_ANGLE_MAX_DEG = 30.0   # loudest reading
 
 
 def _spl_at_full_scale():
@@ -692,10 +872,10 @@ class Bubble:
             math.tau
         )
 
-        self.alpha = random.uniform(
-            140,
-            255
-        )
+        # radius only changes on reset(), not every frame - so the
+        # rendered circle is invalidated here and rebuilt lazily by
+        # draw_bubble() the next time it's drawn, instead of every frame.
+        self.layer = None
 
     def update(self, dt, t):
 
@@ -729,96 +909,85 @@ bubbles = [
 startup_t = 0.0
 
 
-def draw_bubble(
-    surf,
-    x,
-    y,
-    radius,
-    alpha
-):
+def _build_bubble_layer(radius):
+
+    # The old version layered 4 soft glow rings + 2 translucent fills +
+    # a highlight dot, all alpha-blended. On a display that can only
+    # show full white or full black, every one of those alpha levels
+    # just gets crushed to one or the other - so all that blending was
+    # pure wasted computation.
+    #
+    # A *filled* circle, though, just reads as a solid ball rather than
+    # a bubble - there's no visual cue that the inside is hollow. An
+    # outlined ring plus a single offset highlight dot survives the
+    # black/white crush just as cheaply (still one draw call for the
+    # ring, one tiny one for the highlight) while actually reading as
+    # a bubble: dark/empty in the middle, a bright rim, a glint of
+    # "reflection" near the top-left the way a real bubble catches light.
 
     r = max(
         1,
         round(radius)
     )
 
-    size = r * 6
+    size = r * 2
 
     layer = pygame.Surface(
         (size, size),
         pygame.SRCALPHA
     )
 
-    cx = cy = size // 2
-
-    for i in range(4, 0, -1):
-
-        glow_r = r + i * 1.4
-        glow_a = int(
-            alpha * (0.10 / i)
-        )
-
-        pygame.draw.circle(
-            layer,
-            (
-                140,
-                210,
-                255,
-                glow_a
-            ),
-            (cx, cy),
-            int(glow_r)
-        )
-
+    # Ring outline. Smaller bubbles just don't have the pixels to spare
+    # for a multi-pixel-wide outline, so keep it to a hairline everywhere.
     pygame.draw.circle(
         layer,
-        (
-            170,
-            225,
-            255,
-            int(alpha * 0.35)
-        ),
-        (cx, cy),
-        r
-    )
-
-    pygame.draw.circle(
-        layer,
-        (
-            220,
-            245,
-            255,
-            int(alpha * 0.9)
-        ),
-        (cx, cy),
+        WHITE,
+        (r, r),
         r,
-        width=1
+        1
     )
 
+    # Highlight glint, offset toward the upper-left as if catching a
+    # light source. Skip it on bubbles too small to fit one without
+    # touching the outline.
     if r >= 2:
 
-        hl_pos = (
-            cx - max(1, r // 2),
-            cy - max(1, r // 2)
+        highlight_r = 1
+
+        highlight_pos = (
+            max(1, round(r * 0.55)),
+            max(1, round(r * 0.55))
         )
 
         pygame.draw.circle(
             layer,
-            (
-                255,
-                255,
-                255,
-                int(alpha)
-            ),
-            hl_pos,
-            max(1, r // 3)
+            WHITE,
+            highlight_pos,
+            highlight_r
         )
 
+    return layer
+
+
+# draw_bubble() used to rebuild the whole glow layer above from scratch
+# every call. At 14 bubbles x 15fps that's ~210 rebuilds/sec. Since a
+# bubble's radius is fixed for its whole lifetime (only reset() changes
+# it), the layer is built once and cached on the bubble; steady-state
+# frames just blit the cached surface.
+def draw_bubble(surf, bubble):
+
+    if bubble.layer is None:
+        bubble.layer = _build_bubble_layer(
+            bubble.radius
+        )
+
+    size = bubble.layer.get_width()
+
     surf.blit(
-        layer,
+        bubble.layer,
         (
-            x - size // 2,
-            y - size // 2
+            round(bubble.x) - size // 2,
+            round(bubble.y) - size // 2
         )
     )
 
@@ -864,10 +1033,7 @@ def update_startup(dt):
 
         draw_bubble(
             screen,
-            bubble.x,
-            bubble.y,
-            bubble.radius,
-            bubble.alpha
+            bubble
         )
 
     draw_startup_logo(
@@ -1070,6 +1236,8 @@ def eq_adjust(delta):
         current + delta
     )
 
+    schedule_settings_save()
+
 
 def eq_reset_band():
 
@@ -1077,6 +1245,8 @@ def eq_reset_band():
         FREQUENCIES[eq_selected],
         50
     )
+
+    schedule_settings_save()
 
 
 def draw_eq(surface):
@@ -1208,13 +1378,21 @@ left_held_time = 0.0
 right_is_holding = False
 left_is_holding = False
 
-# Holding DOWN (not tapping it) in the "playing" view jumps to the dB
-# meter screen. Longer threshold than seek's, since this is a deliberate
-# "show me the reading" gesture, not something you'd trigger by accident.
+# Holding DOWN (not tapping it) from any screen jumps to the dB meter
+# screen. Longer threshold than seek's, since this is a deliberate
+# "show me the reading" gesture, not something you'd trigger by accident -
+# and it's deliberately longer than a plain tap so it never fights with
+# DOWN's normal per-screen meaning (moving a list selection down, nudging
+# an EQ band down, etc), which fires immediately on key-press regardless
+# of how long the key ends up being held.
 DBMETER_HOLD_THRESHOLD = 1.5
 
 down_held_time = 0.0
 down_is_holding = False
+
+# Remembers which screen to return to when backing out of the dB meter,
+# since it can now be reached by holding DOWN from anywhere.
+dbmeter_return_view = "playing"
 
 seek_position = 0.0
 position_baseline = 0.0
@@ -1232,6 +1410,15 @@ artist_font = pygame.font.SysFont(
 info_font = pygame.font.SysFont(
     "Lower Pixel",
     7
+)
+
+# A bit bigger than info_font - used for the "CAUTION"/"DANGER" status
+# word so it stands out from a steady "OK" without needing to blink to
+# get noticed. Both use this same size so DANGER doesn't read as a step
+# down from CAUTION.
+status_font_alert = pygame.font.SysFont(
+    "Lower Pixel",
+    9
 )
 
 title_rect = pygame.Rect(
@@ -1851,6 +2038,43 @@ def jump_to_track(
 # ===========================================================================
 # PAUSE
 # ===========================================================================
+#
+# Pausing/unpausing stops or starts playback at whatever sample happened
+# to be current - i.e. almost always mid-waveform, not at a zero-crossing.
+# That discontinuity is what makes pause/unpause click or pop. A very
+# short ramp down to silence right before the pause (and back up right
+# after the unpause) hides the jump under near-silence instead of
+# exposing it as an audible edge - short enough that it reads as an
+# instant mute/unmute rather than a perceptible fade.
+
+PAUSE_FADE_SECONDS = 0.04
+PAUSE_FADE_STEPS = 8
+
+
+def _fade_player_volume(start_pct, end_pct):
+    """
+    Synchronous micro-fade of mpv's volume property from start_pct to
+    end_pct. Blocks the caller for PAUSE_FADE_SECONDS total - deliberately
+    synchronous (rather than spread across draw frames) because the fade
+    is shorter than a single frame at this display's frame rate, so
+    there'd be no later frame to continue it on anyway. A few tens of
+    milliseconds of blocking on a user-initiated, once-in-a-while action
+    like pause/unpause isn't noticeable.
+    """
+
+    step_sleep = PAUSE_FADE_SECONDS / PAUSE_FADE_STEPS
+
+    for step in range(1, PAUSE_FADE_STEPS + 1):
+
+        frac = step / PAUSE_FADE_STEPS
+
+        player.volume = (
+            start_pct
+            + (end_pct - start_pct) * frac
+        )
+
+        time.sleep(step_sleep)
+
 
 def toggle_pause():
 
@@ -1861,7 +2085,19 @@ def toggle_pause():
 
     is_paused = not is_paused
 
-    player.pause = is_paused
+    if is_paused:
+
+        # Ramp down to silence, THEN actually pause - so the pause
+        # lands on silence instead of on a click.
+        _fade_player_volume(current_volume, 0)
+        player.pause = True
+
+    else:
+
+        # Unpause first so audio is flowing again, then ramp back up to
+        # the real target volume from silence, same trick in reverse.
+        player.pause = False
+        _fade_player_volume(0, current_volume)
 
 
 # ===========================================================================
@@ -1993,42 +2229,266 @@ def draw_playing(
 # every frame regardless of what's on screen - keeps that cost limited to
 # the moments you've actually asked to see it (hold DOWN in "playing").
 
-def draw_dbmeter():
+# Smoothed needle position, 0.0 (quietest) to 1.0 (loudest). Lives outside
+# draw_vu_meter() because the needle has to remember where it was between
+# frames to swing toward the new target instead of teleporting there -
+# same reason a real VU meter's needle is a physical thing with mass and
+# not just a printout of the current reading.
+_vu_needle_frac = 0.0
 
-    screen.fill(BLACK)
+# ---------------------------------------------------------------------------
+# CAUTION / DANGER, WITHOUT COLOR
+#
+# The display can only show full white or full black - no grayscale, no
+# hue - so the old YELLOW/yellow-vs-RED needle coloring was never actually
+# visible on the hardware; it just got crushed to one polarity or the
+# other. Status now reads through steady shape instead of motion - nothing
+# here blinks:
+#   OK      - normal: white needle/text on black
+#   CAUTION - same layout, but the status word renders in a bigger font
+#             so it stands out from a glance without having to flash
+#   DANGER  - the whole screen inverts to a solid white block with black
+#             text/needle - impossible to miss even at a glance
+# ---------------------------------------------------------------------------
+
+
+def _angle_for_frac(frac):
+
+    deg = (
+        VU_ANGLE_MIN_DEG
+        + (VU_ANGLE_MAX_DEG - VU_ANGLE_MIN_DEG)
+        * frac
+    )
+
+    return math.radians(deg)
+
+
+# The arc + tick marks never change frame to frame - same pivot, same
+# radius, same angles, same two possible colors (WHITE normally, BLACK
+# during the DANGER inversion). Redrawing them with fresh pygame.draw
+# calls (and re-running the angle_for trig for each tick) every single
+# frame was pure repeated work for a picture that's always identical.
+# Build each color's version once, keyed by fg_color, and just blit the
+# cached surface after that - same pattern as the bubble layer cache.
+_vu_gauge_cache = {}
+
+
+def _build_vu_gauge_layer(fg_color, pivot_x, pivot_y, radius):
+
+    layer = pygame.Surface(
+        (SCREEN_WIDTH, SCREEN_HEIGHT),
+        pygame.SRCALPHA
+    )
+
+    arc_rect = pygame.Rect(
+        pivot_x - radius,
+        pivot_y - radius,
+        radius * 2,
+        radius * 2
+    )
+
+    pygame.draw.arc(
+        layer,
+        fg_color,
+        arc_rect,
+        math.radians(VU_ANGLE_MAX_DEG),
+        math.radians(VU_ANGLE_MIN_DEG),
+        1
+    )
+
+    # Tick marks at the low end, center, and high end of the scale.
+    for tick_frac in (0.0, 0.5, 1.0):
+
+        angle = _angle_for_frac(tick_frac)
+
+        inner = (
+            pivot_x + (radius - 4) * math.cos(angle),
+            pivot_y - (radius - 4) * math.sin(angle)
+        )
+        outer = (
+            pivot_x + radius * math.cos(angle),
+            pivot_y - radius * math.sin(angle)
+        )
+
+        pygame.draw.line(
+            layer,
+            fg_color,
+            inner,
+            outer,
+            1
+        )
+
+    return layer
+
+
+def _get_vu_gauge_layer(fg_color, pivot_x, pivot_y, radius):
+
+    key = (fg_color, pivot_x, pivot_y, radius)
+
+    layer = _vu_gauge_cache.get(key)
+
+    if layer is None:
+
+        layer = _build_vu_gauge_layer(
+            fg_color,
+            pivot_x,
+            pivot_y,
+            radius
+        )
+
+        _vu_gauge_cache[key] = layer
+
+    return layer
+
+
+def draw_vu_meter(surface, spl, dt_sec, fg_color, show_needle):
+    """
+    Small analog-style VU needle gauge, à la the classic meter on things
+    like the Fosi Audio MD3's display - an arc, a few tick marks, and a
+    needle that swings and settles rather than snapping straight to the
+    live value.
+    """
+
+    global _vu_needle_frac
+
+    target_frac = max(
+        0.0,
+        min(
+            1.0,
+            (spl - VU_METER_MIN_DB)
+            / (VU_METER_MAX_DB - VU_METER_MIN_DB)
+        )
+    )
+
+    # Exponential approach toward the target - each frame closes some
+    # fraction of the remaining distance, scaled by dt so it swings at
+    # the same real-world speed regardless of frame rate.
+    _vu_needle_frac += (
+        (target_frac - _vu_needle_frac)
+        * min(1.0, dt_sec * VU_NEEDLE_SPEED)
+    )
+
+    pivot_x = 108
+    pivot_y = 30
+    radius = 22
+
+    # Gauge frame stays visible through a CAUTION reading so it reads as
+    # "same meter" rather than a glitch - it's just a cached blit now,
+    # not a fresh draw.
+    surface.blit(
+        _get_vu_gauge_layer(
+            fg_color,
+            pivot_x,
+            pivot_y,
+            radius
+        ),
+        (0, 0)
+    )
+
+    if not show_needle:
+        return
+
+    needle_angle = _angle_for_frac(_vu_needle_frac)
+
+    needle_tip = (
+        pivot_x + (radius - 3) * math.cos(needle_angle),
+        pivot_y - (radius - 3) * math.sin(needle_angle)
+    )
+
+    pygame.draw.line(
+        surface,
+        fg_color,
+        (pivot_x, pivot_y),
+        needle_tip,
+        1
+    )
+
+    pygame.draw.circle(
+        surface,
+        fg_color,
+        (pivot_x, pivot_y),
+        2
+    )
+
+
+def draw_dbmeter(dt_sec):
 
     spl = get_output_spl()
     status = spl_status(spl)
 
-    status_color = {
-        "OK": WHITE,
-        "CAUTION": YELLOW,
-        "DANGER": RED
-    }[status]
+    # Nothing meaningful to show a reading *of* when there's no track
+    # loaded or playback is paused - the meter would just sit there
+    # displaying a near-silent floor value, which reads as "broken"
+    # rather than "quiet". Blank the reading, status word, and needle
+    # out instead, and let them reappear the moment audio actually
+    # starts flowing again.
+    music_active = (
+        bool(queue)
+        and current_tag is not None
+        and not is_paused
+    )
 
+    if status == "DANGER" and music_active:
+
+        # Inverted block: the whole screen flips to solid white with
+        # black content on top - impossible to miss even at a glance,
+        # and it stays solid rather than blinking so it never reads as
+        # "off" mid-flash.
+        screen.fill(WHITE)
+        fg_color = BLACK
+
+    else:
+
+        screen.fill(BLACK)
+        fg_color = WHITE
+
+    show_reading = music_active
+
+    # "SPL" label stays up regardless, so the screen still reads as
+    # "the dB meter, just quiet right now" instead of going blank.
     draw_text(
         "SPL",
         info_font,
-        WHITE,
+        fg_color,
         4,
         2
     )
 
-    draw_text(
-        f"{spl:.0f} dB",
-        title_font,
-        status_color,
-        4,
-        12
+    if show_reading:
+
+        draw_text(
+            f"{spl:.0f} dB",
+            title_font,
+            fg_color,
+            4,
+            12
+        )
+
+        # CAUTION and DANGER both get the bigger, steady status-word
+        # rendering - same size for both so DANGER doesn't look smaller
+        # (and therefore less urgent) than CAUTION.
+        status_font = (
+            status_font_alert
+            if status in ("CAUTION", "DANGER")
+            else info_font
+        )
+
+        draw_text(
+            status,
+            status_font,
+            fg_color,
+            4,
+            24
+        )
+
+    draw_vu_meter(
+        screen,
+        spl,
+        dt_sec,
+        fg_color,
+        show_reading
     )
 
-    draw_text(
-        status,
-        info_font,
-        status_color,
-        4,
-        24
-    )
 
 
 # ===========================================================================
@@ -2214,6 +2674,26 @@ while run:
             # =================================================================
 
             elif event.type == pygame.KEYDOWN:
+
+                # ----------------------------------------------------------------
+                # DB METER HOLD-TO-ACCESS (any screen but startup/dbmeter)
+                # ----------------------------------------------------------------
+                #
+                # This just starts the hold timer - it's a plain `if`, not
+                # part of the shortcut/view elif-chain below, so DOWN still
+                # does its normal per-screen thing immediately (move a list
+                # selection, nudge an EQ band, etc). Only if the key stays
+                # held past DBMETER_HOLD_THRESHOLD (checked once per frame
+                # further down) does it actually switch views.
+
+                if (
+                    event.key == pygame.K_DOWN
+                    and view not in ("startup", "dbmeter")
+                ):
+
+                    down_is_holding = True
+                    down_held_time = 0.0
+                    dbmeter_return_view = view
 
                 # ----------------------------------------------------------------
                 # GLOBAL SHORTCUTS
@@ -2541,7 +3021,11 @@ while run:
                     ):
 
                         eq_backend.set_meter_enabled(False)
-                        view = "playing"
+
+                        # Back out to whichever screen the meter was
+                        # opened from - it can be reached by holding
+                        # DOWN from anywhere now, not just "playing".
+                        view = dbmeter_return_view
 
                     elif event.key == pygame.K_SPACE:
 
@@ -2580,16 +3064,24 @@ while run:
                         left_is_holding = True
                         left_held_time = 0.0
 
-                    elif event.key == pygame.K_DOWN:
-
-                        down_is_holding = True
-                        down_held_time = 0.0
+                    # DOWN-hold-to-dbmeter is handled globally above.
 
             # =================================================================
             # KEY UP
             # =================================================================
 
             elif event.type == pygame.KEYUP:
+
+                # DOWN-hold-to-dbmeter can now start from any screen, so
+                # its release has to be handled unconditionally too -
+                # not just while on "playing"/"dbmeter". Releasing before
+                # the hold threshold is just a tap - whatever that screen
+                # normally does with DOWN already happened on key-press,
+                # so there's nothing further to do here.
+                if event.key == pygame.K_DOWN:
+
+                    down_is_holding = False
+                    down_held_time = 0.0
 
                 if view in ("playing", "dbmeter"):
 
@@ -2624,13 +3116,6 @@ while run:
 
                         left_is_holding = False
                         left_held_time = 0.0
-
-                    elif event.key == pygame.K_DOWN:
-
-                        # Releasing before the hold threshold is just a
-                        # tap - no bound action, so nothing happens.
-                        down_is_holding = False
-                        down_held_time = 0.0
 
         # ===================================================================
         # IDLE / SCREENSAVER TIMEOUT
@@ -2710,21 +3195,24 @@ while run:
                             -SEEK_STEP
                         )
 
-            if down_is_holding:
+        # DOWN-hold-to-dbmeter works from any screen (see the KEYDOWN
+        # handler above), so it's checked unconditionally here too -
+        # not nested under the "playing"/"dbmeter"-only seek check above.
+        if down_is_holding:
 
-                down_held_time += dt_sec
+            down_held_time += dt_sec
 
-                if down_held_time >= DBMETER_HOLD_THRESHOLD:
+            if down_held_time >= DBMETER_HOLD_THRESHOLD:
 
-                    eq_backend.set_meter_enabled(True)
-                    view = "dbmeter"
+                eq_backend.set_meter_enabled(True)
+                view = "dbmeter"
 
-                    # One-shot: stop tracking the hold immediately so
-                    # continuing to hold DOWN on the new screen doesn't
-                    # do anything else, and releasing later doesn't
-                    # re-trigger a switch back into "playing".
-                    down_is_holding = False
-                    down_held_time = 0.0
+                # One-shot: stop tracking the hold immediately so
+                # continuing to hold DOWN on the new screen doesn't
+                # do anything else, and releasing later doesn't
+                # re-trigger a switch back into the previous screen.
+                down_is_holding = False
+                down_held_time = 0.0
 
         # ===================================================================
         # DRAW
@@ -2809,9 +3297,13 @@ while run:
 
         elif view == "dbmeter":
 
-            draw_dbmeter()
+            draw_dbmeter(dt_sec)
 
         pygame.display.flip()
 
+
+# Make sure the most recent volume/EQ change actually lands on disk even
+# if it happened inside the debounce window right before quitting.
+flush_settings_save()
 
 pygame.quit()
