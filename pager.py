@@ -19,7 +19,6 @@ import mpv # type: ignore
 # ===========================================================================
 
 MU_LOC = open("/root/pager/loc.txt").read()
-print(os.getcwd())
 
 # Volume and EQ get persisted here so the next boot picks up right where
 # the last session left off, instead of coming back up at the defaults
@@ -185,7 +184,8 @@ FREQUENCIES = [
     2000,
     4000,
     8000,
-    16000
+    16000,
+    20000
 ]
 
 
@@ -772,10 +772,6 @@ def scan_library():
         scanned_artists[artist_name].sort(
             key=lambda f: scanned_track_nums[f]
         )
-
-    print(scanned_files)
-    print(scanned_albums)
-    print(scanned_artists)
 
     files.extend(scanned_files)
     albums.update(scanned_albums)
@@ -1947,14 +1943,6 @@ def start_playing(
         queue[0]
     )
 
-    print()
-    print("================================")
-    print("START PLAYING")
-    print("queue:", queue)
-    print("start_index:", start_index)
-    print("first file:", first_file)
-    print("================================")
-
     player.command(
         "loadfile",
         first_file,
@@ -2018,11 +2006,6 @@ def jump_to_track(
 
     is_paused = False
 
-    print()
-    print("JUMP TO TRACK")
-    print("queue:", queue)
-    print("requested index:", new_index)
-    print("requested file:", queue[new_index])
 
     # IMPORTANT:
     # Do not manually update queue_index here.
