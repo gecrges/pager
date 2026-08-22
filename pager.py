@@ -29,7 +29,48 @@ pygame.init()
 
 player = mpv.MPV(
     video=False,
-    audio_device='auto'
+    audio_device='auto',
+
+    # ---------------------------------------------------------------------
+    # GAPLESS AUDIO
+    #
+    # gapless-audio has three settings:
+    #
+    #   yes  - open the AO once, using the FIRST file's format, and keep
+    #          it open for the whole playlist. Every later file that
+    #          doesn't match gets resampled/reformatted on the fly to fit
+    #          whatever the first file happened to be. That's exactly the
+    #          "lock to track one, downgrade everything else" behavior we
+    #          don't want - a 16-bit/44.1kHz opener would drag every
+    #          hi-res FLAC after it down to CD quality for the rest of
+    #          the queue.
+    #
+    #   weak - keep the AO open only for as long as consecutive tracks
+    #          actually share a compatible format. The instant a track's
+    #          format doesn't match what the device is already running,
+    #          mpv closes and reopens the AO using THAT track's native
+    #          format - no forced resampling, ever. Tracks within an
+    #          album are gapless (same rip, same format, device stays
+    #          open); a jump to a differently-sourced album just gets a
+    #          clean reopen instead of a silent quality hit.
+    #
+    #   no   - reopen the AO on every single track, gapless or not.
+    #
+    # Set explicitly (rather than relying on whatever mpv's compiled-in
+    # default happens to be) so this can't quietly change out from under
+    # us on an mpv upgrade. weak is the only one of the three that can
+    # never resample a track to match another track's format.
+    #
+    # This also answers "does it need to reset per queue/album": it does,
+    # and it already gets that for free. start_playing() rebuilds the
+    # playlist with "loadfile ... replace", which is a hard stop-and-play,
+    # not a gapless playlist-advance - so every new queue starts the AO
+    # fresh from that queue's own first track, regardless of whatever
+    # format the previous album left the device in. weak only has to
+    # cover transitions *within* a queue, where the constant-quality-per-
+    # album assumption actually holds.
+    # ---------------------------------------------------------------------
+    gapless_audio='weak'
 )
 
 SCREEN_WIDTH = 128
@@ -1942,6 +1983,15 @@ def start_playing(
         queue[0]
     )
 
+    # "replace" is a hard stop-and-play, not a gapless playlist-advance -
+    # this is what gives every new queue a clean audio device reset using
+    # THIS queue's own first track, no matter what format the previous
+    # album left the device in. Do not swap this for something like
+    # "playlist-clear" + "append" to try to be gentler about it: that
+    # would risk keeping the old AO alive (via gapless-audio=weak) into a
+    # queue that's supposed to start fresh. See the gapless-audio comment
+    # on the MPV() constructor for the full reasoning - "replace" here is
+    # load-bearing, not incidental.
     player.command(
         "loadfile",
         first_file,
