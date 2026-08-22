@@ -1,15 +1,40 @@
 import io
 import json
 import math
+import os
 import random
 import threading
 import time
+import warnings
+import wave
+from contextlib import contextmanager
 from os import listdir
 from os.path import isfile, join
 
+# PYGAME_HIDE_SUPPORT_PROMPT has to be set before pygame is imported -
+# pygame reads it at import time, not at pygame.init() time. It silences
+# the "Hello from the pygame community" banner.
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+
+# The "your system is avx2 capable but pygame was not built with support
+# for it" message is a real RuntimeWarning raised during pygame's import,
+# not something printed to stdout/stderr directly - so it has to be
+# silenced with the warnings module, not an env var. (PYGAME_DETECT_AVX2
+# is a compile-time flag for people building pygame from source; setting
+# it on an already-built wheel at runtime, like here, does nothing - an
+# earlier pass at this used that and it didn't actually work.) The
+# warning itself is harmless: it's a note about blit performance on a
+# tiny 128x32 display that never approaches needing SIMD.
+with warnings.catch_warnings():
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*avx2.*",
+        category=RuntimeWarning
+    )
+    import pygame # type: ignore
+
 import numpy as np # type: ignore
 from tinytag import TinyTag # type: ignore
-import pygame # type: ignore
 import mpv # type: ignore
 
 
@@ -25,7 +50,69 @@ MU_LOC = open("/root/pager/loc.txt").read()
 # where it does - one fixed, known location regardless of cwd.
 SETTINGS_PATH = "/root/pager/settings.json"
 
-pygame.init()
+# SDL (via pygame's display init) checks XDG_RUNTIME_DIR while probing
+# video backends, and prints "error: XDG_RUNTIME_DIR is invalid or not
+# set" straight to stderr - bypassing Python's warnings system entirely -
+# when it's missing. That's normally set up by a desktop login session,
+# which this headless/root pager setup never goes through. Give it a
+# real, private directory of our own instead of leaving it unset, same
+# as a login session would.
+_xdg_runtime_dir = f"/tmp/xdg-runtime-{os.getuid()}"
+os.makedirs(_xdg_runtime_dir, exist_ok=True)
+os.chmod(_xdg_runtime_dir, 0o700)
+os.environ.setdefault("XDG_RUNTIME_DIR", _xdg_runtime_dir)
+
+
+@contextmanager
+def _suppress_native_stderr():
+    """
+    Temporarily redirects the OS-level stderr file descriptor to
+    /dev/null, then restores it.
+
+    This is specifically for the couple of SDL calls below that print
+    straight to the C-level stderr fd (things like "VMware: No 3D
+    enabled") rather than raising a Python warning/exception - normal
+    output suppression (redirecting sys.stderr) doesn't touch those,
+    because SDL isn't writing through Python's sys.stderr object at all.
+
+    Deliberately scoped to a `with` block around just those calls,
+    rather than applied for the program's whole lifetime, so a real
+    Python-level error anywhere else still prints normally.
+    """
+
+    stderr_fd = 2
+
+    saved_fd = os.dup(stderr_fd)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+
+    try:
+        os.dup2(devnull_fd, stderr_fd)
+        yield
+
+    finally:
+        os.dup2(saved_fd, stderr_fd)
+        os.close(devnull_fd)
+        os.close(saved_fd)
+
+
+# Deliberately NOT pygame.init() - that blanket-inits every subsystem,
+# including pygame's own SDL audio/mixer. This app never plays audio
+# through pygame; mpv owns the sound card entirely. Bringing up a second,
+# unused SDL audio device alongside mpv's is exactly what was causing:
+#   - the random blip of sound on startup (SDL opening its audio device),
+#   - the recurring "ALSA lib pcm.c ... underrun occurred" spam (two
+#     separate audio clients fighting over the same ALSA hardware device).
+#
+# Only initialize the two subsystems this file actually uses: display
+# (for the window/surface) and font (for text rendering). Both are
+# wrapped in _suppress_native_stderr() to hide the harmless "no 3D
+# acceleration" notice SDL prints in this VM - this display is a plain
+# 2D surface, never touches OpenGL/3D, so that notice never meant
+# anything for this app to begin with.
+with _suppress_native_stderr():
+    pygame.display.init()
+    pygame.font.init()
+
 
 player = mpv.MPV(
     video=False,
@@ -61,17 +148,74 @@ player = mpv.MPV(
     # us on an mpv upgrade. weak is the only one of the three that can
     # never resample a track to match another track's format.
     #
-    # This also answers "does it need to reset per queue/album": it does,
-    # and it already gets that for free. start_playing() rebuilds the
-    # playlist with "loadfile ... replace", which is a hard stop-and-play,
-    # not a gapless playlist-advance - so every new queue starts the AO
-    # fresh from that queue's own first track, regardless of whatever
-    # format the previous album left the device in. weak only has to
-    # cover transitions *within* a queue, where the constant-quality-per-
-    # album assumption actually holds.
+    # This also answers "does it need to reset per queue/album": weak's
+    # format-compatibility check runs on every file-to-file transition,
+    # not just within a queue - a new album's first track gets exactly
+    # the same treatment as any other track change: kept gapless if the
+    # format matches whatever's already open, cleanly reopened (never
+    # resampled) if it doesn't. No special-casing needed at queue
+    # boundaries for that to hold.
     # ---------------------------------------------------------------------
     gapless_audio='weak'
 )
+
+# ---------------------------------------------------------------------------
+# AUDIO DEVICE PRIMING
+#
+# The glitch on the very first track of a session (only the first - never
+# on later tracks or later albums) is the ALSA device's own first-open
+# cost: the very first time anything opens the sound device, there's a
+# chunk of one-time setup (device/driver handshake, buffer allocation,
+# in this VM specifically the virtual sound card's own negotiation) that
+# has nothing to do with mpv's software buffering - which is why raising
+# --audio-buffer above didn't help; that buffer was never the bottleneck.
+#
+# The fix is to pay that one-time cost before the user ever presses play,
+# not during their first song. Immediately on startup, open the AO for
+# real by looping a silent clip through it, muted. That forces the device
+# through its one-time setup right now, on inaudible silence, instead of
+# on the first few hundred ms of an actual track. When the user picks
+# real music, start_playing() unmutes - by then the device has already
+# been open and running for as long as they spent browsing menus, so
+# there's nothing left to warm up.
+#
+# A generated silent WAV is used (rather than e.g. leaving the AO
+# unopened until first real use) specifically because it forces mpv to
+# actually open the device now - just loading nothing, or loading a file
+# without playing it, wouldn't touch the AO at all.
+# ---------------------------------------------------------------------------
+
+def _make_silence_wav(path, seconds=2.0, samplerate=44100, channels=2):
+
+    frame_count = int(seconds * samplerate)
+
+    with wave.open(path, "wb") as wav_file:
+
+        wav_file.setnchannels(channels)
+        wav_file.setsampwidth(2)  # 16-bit
+        wav_file.setframerate(samplerate)
+        wav_file.writeframes(
+            b"\x00\x00" * channels * frame_count
+        )
+
+
+_PRIMER_PATH = "/tmp/pager_silence_primer.wav"
+
+_make_silence_wav(_PRIMER_PATH)
+
+player.mute = True
+
+player.command(
+    "loadfile",
+    _PRIMER_PATH,
+    "replace"
+)
+
+# Keep it looping - browsing menus can take anywhere from a second to
+# several minutes, and the AO needs to stay open and fed that whole time
+# so it's still warm whenever the user actually presses play.
+player["loop-file"] = "inf"
+
 
 SCREEN_WIDTH = 128
 SCREEN_HEIGHT = 32
@@ -1983,20 +2127,37 @@ def start_playing(
         queue[0]
     )
 
-    # "replace" is a hard stop-and-play, not a gapless playlist-advance -
-    # this is what gives every new queue a clean audio device reset using
-    # THIS queue's own first track, no matter what format the previous
-    # album left the device in. Do not swap this for something like
-    # "playlist-clear" + "append" to try to be gentler about it: that
-    # would risk keeping the old AO alive (via gapless-audio=weak) into a
-    # queue that's supposed to start fresh. See the gapless-audio comment
-    # on the MPV() constructor for the full reasoning - "replace" here is
-    # load-bearing, not incidental.
+    # "replace" stops the currently-loaded item (the silence primer, on
+    # the very first call - see the priming block up by MPV() - or the
+    # previous album on any later call) and loads this queue's first
+    # track in its place. Whether the AO itself stays open through that
+    # switch or gets cleanly reopened is gapless-audio=weak's call, based
+    # on whether this track's format matches whatever's already playing -
+    # same rule as any other track-to-track transition, nothing extra to
+    # do here.
     player.command(
         "loadfile",
         first_file,
         "replace"
     )
+
+    # Undo the two priming-only settings from the MPV() constructor now
+    # that a real queue is taking over:
+    #
+    #   - mute: only there to keep the silent warm-up clip inaudible.
+    #   - loop-file: only there to keep that one silent clip looping
+    #     while the user browses menus. Left at "inf" it would apply to
+    #     THIS track too, and since it's an mpv option (not something
+    #     scoped to the primer file) it doesn't clear itself on its own -
+    #     it would keep repeating whatever's currently loaded forever,
+    #     which is exactly what was blocking normal advance to the next
+    #     track in the queue.
+    #
+    # Harmless to set on every call, not just the first - both are
+    # already off/no after the first real queue starts, so this is just
+    # a no-op from then on.
+    player.mute = False
+    player["loop-file"] = "no"
 
     # Append everything else, in order - the whole queue, not just the
     # tail after start_index.
@@ -2240,16 +2401,6 @@ def draw_playing(
         85,
         12
     )
-
-    if is_paused:
-
-        draw_text(
-            "||",
-            info_font,
-            WHITE,
-            118,
-            20
-        )
 
 
 # ===========================================================================
