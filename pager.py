@@ -2543,6 +2543,20 @@ while run:
                         eq_backend.set_meter_enabled(False)
                         view = "playing"
 
+                    elif event.key == pygame.K_SPACE:
+
+                        toggle_pause()
+
+                    elif event.key == pygame.K_RIGHT:
+
+                        right_is_holding = True
+                        right_held_time = 0.0
+
+                    elif event.key == pygame.K_LEFT:
+
+                        left_is_holding = True
+                        left_held_time = 0.0
+
                 elif view == "playing":
 
                     if event.key in (
@@ -2577,7 +2591,7 @@ while run:
 
             elif event.type == pygame.KEYUP:
 
-                if view == "playing":
+                if view in ("playing", "dbmeter"):
 
                     if event.key == pygame.K_RIGHT:
 
@@ -2634,7 +2648,7 @@ while run:
         # CONTINUOUS SEEK
         # ===================================================================
 
-        if view == "playing":
+        if view in ("playing", "dbmeter"):
 
             if right_is_holding:
 
